@@ -1,25 +1,23 @@
 #include <Arduino.h>
+#include <SD.h>
+#include <SPI.h>
 #include <M5GFX.h>
 #include <M5PM1.h>
 #include <M5Unified.h>
 #include <M5UnitENV.h>
-#include <SD.h>
-#include <SPI.h>
-
-static constexpr int SHT_SDA_PIN = 3;
-static constexpr int SHT_SCL_PIN = 2;
+#include "default_image.h"
 
 static constexpr uint8_t SD_SPI_CS_PIN = 47;
 static constexpr uint8_t SD_SPI_SCK_PIN = 15;
 static constexpr uint8_t SD_SPI_MOSI_PIN = 13;
 static constexpr uint8_t SD_SPI_MISO_PIN = 14;
+static constexpr uint8_t SHT40_MEASURE_HIGH_PRECISION = 0xFD;
 
 static constexpr std::size_t MAX_IMAGE_FILES = 32;
-static constexpr uint32_t SENSOR_UPDATE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+static constexpr uint32_t SENSOR_UPDATE_INTERVAL_MS = 30UL * 60UL * 1000UL;
 static constexpr int SWIPE_THRESHOLD_PX = 80;
 
 M5PM1 pm1;
-SHT4X sht4;
 
 String imagePaths[MAX_IMAGE_FILES];
 std::size_t imageCount = 0;
@@ -35,6 +33,31 @@ float temperatureC = 0.0f;
 float humidityPct = 0.0f;
 int lastRtcSlot = -1;
 uint32_t lastSensorUpdateMs = 0;
+m5::I2C_Class* sensorBus = nullptr;
+uint8_t sensorAddr = SHT40_I2C_ADDR_44;
+
+struct ScreenLayout {
+  int screenW;
+  int screenH;
+  int margin;
+  int gap;
+  int cardH;
+  int cardY;
+  int imageX;
+  int imageY;
+  int imageW;
+  int imageH;
+  int cardW;
+  int tempCardX;
+  int humCardX;
+  int cardRadius;
+  int sensorTopY;
+  int sensorH;
+};
+
+ScreenLayout screenLayout {};
+M5Canvas imageCanvas(&M5.Display);
+M5Canvas sensorCanvas(&M5.Display);
 
 static String normalizeRootPath(const char* path)
 {
@@ -125,95 +148,175 @@ static void loadImageList()
   }
 }
 
-static bool drawCurrentImage(int x, int y, int width, int height)
+static bool drawCurrentImage(lgfx::LGFXBase& gfx, int x, int y, int width, int height)
 {
-  if (!sdReady || imageCount == 0) {
-    return false;
+  if (sdReady && imageCount != 0) {
+    const String& path = imagePaths[currentImageIndex];
+    String lower = path;
+    lower.toLowerCase();
+
+    if (lower.endsWith(".png")) {
+      return gfx.drawPngFile(SD, path.c_str(), x, y, width, height, 0, 0, 0.0f, 0.0f, middle_center);
+    } else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+      return gfx.drawJpgFile(SD, path.c_str(), x, y, width, height, 0, 0, 0.0f, 0.0f, middle_center);
+    } else if (lower.endsWith(".bmp")) {
+      return gfx.drawBmpFile(SD, path.c_str(), x, y, width, height, 0, 0, 0.0f, 0.0f, middle_center);
+    }
   }
 
-  const String& path = imagePaths[currentImageIndex];
-  String lower = path;
-  lower.toLowerCase();
-
-  if (lower.endsWith(".png")) {
-    return M5.Display.drawPngFile(SD, path.c_str(), x, y, width, height);
-  }
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-    return M5.Display.drawJpgFile(SD, path.c_str(), x, y, width, height);
-  }
-  if (lower.endsWith(".bmp")) {
-    return M5.Display.drawBmpFile(SD, path.c_str(), x, y, width, height);
-  }
-  return false;
+  return gfx.drawPng(default_image_png, default_image_png_len, x, y, width, height, 0, 0, 0.0f, 0.0f, middle_center);
 }
 
 static bool updateSensorReading()
 {
-  if (!sensorReady) {
+  if (!sensorReady || sensorBus == nullptr) {
     return false;
   }
 
-  if (!sht4.update()) {
+  if (!(sensorBus->start(sensorAddr, false, 400000U) && sensorBus->write(SHT40_MEASURE_HIGH_PRECISION) && sensorBus->stop())) {
+    Serial.println("SHT40 write failed.");
+    return false;
+  }
+
+  delay(10);
+
+  uint8_t readbuffer[6];
+  if (!(sensorBus->start(sensorAddr, true, 400000U) && sensorBus->read(readbuffer, sizeof(readbuffer), true) &&
+        sensorBus->stop())) {
+    Serial.println("SHT40 read failed.");
+    return false;
+  }
+
+  auto crc8 = [](const uint8_t* data, size_t len) -> uint8_t {
+    uint8_t crc = 0xFF;
+    while (len--) {
+      crc ^= *data++;
+      for (uint8_t bit = 0; bit < 8; ++bit) {
+        crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0x31) : static_cast<uint8_t>(crc << 1);
+      }
+    }
+    return crc;
+  };
+
+  if (readbuffer[2] != crc8(readbuffer, 2) || readbuffer[5] != crc8(readbuffer + 3, 2)) {
     Serial.println("SHT40 update failed.");
     return false;
   }
 
-  temperatureC = sht4.cTemp;
-  humidityPct = sht4.humidity;
+  const float t_ticks = static_cast<uint16_t>(readbuffer[0] << 8 | readbuffer[1]);
+  const float rh_ticks = static_cast<uint16_t>(readbuffer[3] << 8 | readbuffer[4]);
+  temperatureC = -45.0f + (175.0f * t_ticks / 65535.0f);
+  humidityPct = -6.0f + (125.0f * rh_ticks / 65535.0f);
+  humidityPct = min(max(humidityPct, 0.0f), 100.0f);
   hasSensorReading = true;
   Serial.printf("Sensor updated: %.1f C / %.1f %%\r\n", temperatureC, humidityPct);
   return true;
 }
 
-template <typename TFont>
-static void drawCenteredText(const String& text, int x, int y, const TFont* font, uint16_t color, textdatum_t datum)
+static bool beginSensor()
 {
-  M5.Display.setFont(font);
-  M5.Display.setTextColor(color);
-  M5.Display.setTextDatum(datum);
-  M5.Display.drawString(text, x, y);
-}
+  struct SensorBusCandidate {
+    m5::I2C_Class* bus;
+    uint8_t addr;
+    const char* label;
+  };
 
-static void renderScreen()
-{
-  const int screenW = M5.Display.width();
-  const int screenH = M5.Display.height();
-  const int margin = 18;
-  const int gap = 14;
-  const int cardH = 180;
-  const int cardY = screenH - margin - cardH;
-  const int imageX = margin;
-  const int imageY = margin;
-  const int imageW = screenW - (margin * 2);
-  const int imageH = cardY - gap - imageY;
-  const int cardW = (screenW - (margin * 2) - gap) / 2;
+  static SensorBusCandidate candidates[] = {
+      {&M5.In_I2C, SHT40_I2C_ADDR_44, "In_I2C GPIO2/3 addr 0x44"},
+      {&M5.In_I2C, SHT40_I2C_ADDR_45, "In_I2C GPIO2/3 addr 0x45"},
+      {&M5.Ex_I2C, SHT40_I2C_ADDR_44, "Ex_I2C GPIO5/4 addr 0x44"},
+      {&M5.Ex_I2C, SHT40_I2C_ADDR_45, "Ex_I2C GPIO5/4 addr 0x45"},
+  };
 
-  M5.Display.fillScreen(WHITE);
-  M5.Display.drawRoundRect(imageX, imageY, imageW, imageH, 10, BLACK);
-
-  if (!drawCurrentImage(imageX + 6, imageY + 6, imageW - 12, imageH - 12)) {
-    drawCenteredText("No SD nameplate image", screenW / 2, imageY + (imageH / 2) - 14, &fonts::FreeSansBold18pt7b,
-                     RED, middle_center);
-    drawCenteredText("Put PNG/JPG/BMP in /", screenW / 2, imageY + (imageH / 2) + 20, &fonts::Font4, BLACK,
-                     middle_center);
+  for (const auto& candidate : candidates) {
+    if (candidate.bus->scanID(candidate.addr, 400000U)) {
+      sensorBus = candidate.bus;
+      sensorAddr = candidate.addr;
+      Serial.printf("SHT40 found on %s\r\n", candidate.label);
+      return true;
+    }
   }
 
-  drawCenteredText("Swipe left/right to change the image", screenW / 2, cardY - 6, &fonts::Font2, BLACK,
+  Serial.println("SHT40 not found on any expected I2C bus.");
+  return false;
+}
+
+static bool updateSensorReadingWithRetry(uint8_t attempts, uint32_t retryDelayMs)
+{
+  for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+    if (updateSensorReading()) {
+      return true;
+    }
+    if (attempt + 1 < attempts) {
+      delay(retryDelayMs);
+    }
+  }
+  return false;
+}
+
+static void drawCenteredText(lgfx::LGFXBase& gfx, const String& text, int x, int y, const lgfx::IFont* font, uint16_t color,
+                             textdatum_t datum)
+{
+  gfx.setFont(font);
+  gfx.setTextColor(color);
+  gfx.setTextDatum(datum);
+  gfx.drawString(text, x, y);
+}
+
+static ScreenLayout getScreenLayout()
+{
+  ScreenLayout layout {};
+  layout.screenW = M5.Display.width();
+  layout.screenH = M5.Display.height();
+  layout.margin = 18;
+  layout.gap = 14;
+  layout.cardH = 180;
+  layout.cardY = layout.screenH - layout.margin - layout.cardH;
+  layout.imageX = layout.margin;
+  layout.imageY = layout.margin;
+  layout.imageW = layout.screenW - (layout.margin * 2);
+  layout.imageH = layout.cardY - layout.gap - layout.imageY;
+  layout.cardW = (layout.screenW - (layout.margin * 2) - layout.gap) / 2;
+  layout.tempCardX = layout.margin;
+  layout.humCardX = layout.margin + layout.cardW + layout.gap;
+  layout.cardRadius = 14;
+  layout.sensorTopY = layout.cardY - 40;
+  layout.sensorH = layout.screenH - layout.sensorTopY;
+  return layout;
+}
+
+static void renderImageSection()
+{
+  imageCanvas.fillSprite(WHITE);
+  imageCanvas.drawRoundRect(0, 0, screenLayout.imageW, screenLayout.imageH, 10, BLACK);
+
+  if (!drawCurrentImage(imageCanvas, 6, 6, screenLayout.imageW - 12, screenLayout.imageH - 12)) {
+    drawCenteredText(imageCanvas, "No image available", screenLayout.imageW / 2, (screenLayout.imageH / 2) - 14,
+                     &fonts::FreeSansBold18pt7b, RED, middle_center);
+    drawCenteredText(imageCanvas, "Embedded default image failed", screenLayout.imageW / 2, (screenLayout.imageH / 2) + 20,
+                     &fonts::Font4, BLACK, middle_center);
+  }
+
+  imageCanvas.pushSprite(screenLayout.imageX, screenLayout.imageY);
+}
+
+static void renderSensorSection()
+{
+  const int cardLocalY = screenLayout.cardY - screenLayout.sensorTopY;
+  const int swipeLocalY = (screenLayout.cardY - 6) - screenLayout.sensorTopY;
+
+  sensorCanvas.fillSprite(WHITE);
+  drawCenteredText(sensorCanvas, "Swipe left/right to change the image", screenLayout.screenW / 2, swipeLocalY, &fonts::Font2, BLACK,
                    bottom_center);
+  sensorCanvas.fillRoundRect(screenLayout.tempCardX, cardLocalY, screenLayout.cardW, screenLayout.cardH, screenLayout.cardRadius, WHITE);
+  sensorCanvas.fillRoundRect(screenLayout.humCardX, cardLocalY, screenLayout.cardW, screenLayout.cardH, screenLayout.cardRadius, WHITE);
+  sensorCanvas.drawRoundRect(screenLayout.tempCardX, cardLocalY, screenLayout.cardW, screenLayout.cardH, screenLayout.cardRadius, RED);
+  sensorCanvas.drawRoundRect(screenLayout.humCardX, cardLocalY, screenLayout.cardW, screenLayout.cardH, screenLayout.cardRadius, BLUE);
 
-  const int tempCardX = margin;
-  const int humCardX = margin + cardW + gap;
-  const int cardRadius = 14;
-
-  M5.Display.fillRoundRect(tempCardX, cardY, cardW, cardH, cardRadius, WHITE);
-  M5.Display.fillRoundRect(humCardX, cardY, cardW, cardH, cardRadius, WHITE);
-  M5.Display.drawRoundRect(tempCardX, cardY, cardW, cardH, cardRadius, RED);
-  M5.Display.drawRoundRect(humCardX, cardY, cardW, cardH, cardRadius, BLUE);
-
-  drawCenteredText("TEMPERATURE", tempCardX + (cardW / 2), cardY + 28, &fonts::FreeSansBold12pt7b, RED,
-                   top_center);
-  drawCenteredText("HUMIDITY", humCardX + (cardW / 2), cardY + 28, &fonts::FreeSansBold12pt7b, BLUE,
-                   top_center);
+  drawCenteredText(sensorCanvas, "TEMPERATURE", screenLayout.tempCardX + (screenLayout.cardW / 2), cardLocalY + 28,
+                   &fonts::FreeSansBold12pt7b, RED, top_center);
+  drawCenteredText(sensorCanvas, "HUMIDITY", screenLayout.humCardX + (screenLayout.cardW / 2), cardLocalY + 28,
+                   &fonts::FreeSansBold12pt7b, BLUE, top_center);
 
   if (hasSensorReading) {
     char tempText[24];
@@ -221,25 +324,33 @@ static void renderScreen()
     snprintf(tempText, sizeof(tempText), "%.1f C", temperatureC);
     snprintf(humText, sizeof(humText), "%.1f %%", humidityPct);
 
-    drawCenteredText(tempText, tempCardX + (cardW / 2), cardY + 108, &fonts::FreeSansBold24pt7b, BLACK,
-                     middle_center);
-    drawCenteredText(humText, humCardX + (cardW / 2), cardY + 108, &fonts::FreeSansBold24pt7b, BLACK,
-                     middle_center);
+    drawCenteredText(sensorCanvas, tempText, screenLayout.tempCardX + (screenLayout.cardW / 2), cardLocalY + 108,
+                     &fonts::FreeSansBold24pt7b, BLACK, middle_center);
+    drawCenteredText(sensorCanvas, humText, screenLayout.humCardX + (screenLayout.cardW / 2), cardLocalY + 108,
+                     &fonts::FreeSansBold24pt7b, BLACK, middle_center);
   } else if (sensorReady) {
-    drawCenteredText("Updating...", tempCardX + (cardW / 2), cardY + 108, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
-    drawCenteredText("Updating...", humCardX + (cardW / 2), cardY + 108, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
+    drawCenteredText(sensorCanvas, "Updating...", screenLayout.tempCardX + (screenLayout.cardW / 2), cardLocalY + 108,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
+    drawCenteredText(sensorCanvas, "Updating...", screenLayout.humCardX + (screenLayout.cardW / 2), cardLocalY + 108,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
   } else {
-    drawCenteredText("Sensor", tempCardX + (cardW / 2), cardY + 92, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
-    drawCenteredText("not found", tempCardX + (cardW / 2), cardY + 128, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
-    drawCenteredText("Sensor", humCardX + (cardW / 2), cardY + 92, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
-    drawCenteredText("not found", humCardX + (cardW / 2), cardY + 128, &fonts::FreeSansBold18pt7b, BLACK,
-                     middle_center);
+    drawCenteredText(sensorCanvas, "Sensor", screenLayout.tempCardX + (screenLayout.cardW / 2), cardLocalY + 92,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
+    drawCenteredText(sensorCanvas, "not found", screenLayout.tempCardX + (screenLayout.cardW / 2), cardLocalY + 128,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
+    drawCenteredText(sensorCanvas, "Sensor", screenLayout.humCardX + (screenLayout.cardW / 2), cardLocalY + 92,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
+    drawCenteredText(sensorCanvas, "not found", screenLayout.humCardX + (screenLayout.cardW / 2), cardLocalY + 128,
+                     &fonts::FreeSansBold18pt7b, BLACK, middle_center);
   }
+
+  sensorCanvas.pushSprite(0, screenLayout.sensorTopY);
+}
+
+static void renderScreen()
+{
+  renderImageSection();
+  renderSensorSection();
 }
 
 static void selectRelativeImage(int step)
@@ -252,7 +363,7 @@ static void selectRelativeImage(int step)
   const int current = static_cast<int>(currentImageIndex);
   currentImageIndex = static_cast<std::size_t>((current + step + count) % count);
   Serial.printf("Selected image: %s\r\n", imagePaths[currentImageIndex].c_str());
-  renderScreen();
+  renderImageSection();
 }
 
 static void handleSwipeSelection()
@@ -281,8 +392,8 @@ static void refreshSensorIfNeeded()
 
   if (rtcReady) {
     const auto now = M5.Rtc.getDateTime();
-    const int slot = ((now.time.hours * 60) + now.time.minutes) / 5;
-    if (lastRtcSlot != slot) {
+    const int slot = ((now.time.hours * 60) + now.time.minutes) / 30;
+    if (!hasSensorReading || lastRtcSlot != slot) {
       lastRtcSlot = slot;
       shouldRefresh = true;
     }
@@ -301,8 +412,9 @@ static void refreshSensorIfNeeded()
   if (!rtcReady) {
     lastSensorUpdateMs = millis();
   }
-  updateSensorReading();
-  renderScreen();
+  if (updateSensorReadingWithRetry(hasSensorReading ? 1 : 5, 50)) {
+    renderSensorSection();
+  }
 }
 
 void setup()
@@ -311,27 +423,31 @@ void setup()
   cfg.clear_display = false;
   M5.begin(cfg);
   Serial.begin(115200);
+  M5.Ex_I2C.begin();
 
   M5.Display.setRotation(0);
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);
-  M5.Display.fillScreen(WHITE);
+  screenLayout = getScreenLayout();
+  imageCanvas.createSprite(screenLayout.imageW, screenLayout.imageH);
+  sensorCanvas.createSprite(screenLayout.screenW, screenLayout.sensorH);
 
   powerReady = beginPowerControl();
   sdReady = beginSdCard();
   loadImageList();
 
-  sensorReady = sht4.begin(&Wire, SHT40_I2C_ADDR_44, SHT_SDA_PIN, SHT_SCL_PIN, 400000U);
-  if (!sensorReady) {
-    Serial.println("SHT40 not found.");
-  }
+  sensorReady = beginSensor();
 
   rtcReady = M5.Rtc.isEnabled();
   if (!rtcReady) {
     Serial.println("RTC not available. Falling back to millis().");
   }
 
+  if (rtcReady) {
+    const auto now = M5.Rtc.getDateTime();
+    lastRtcSlot = ((now.time.hours * 60) + now.time.minutes) / 30;
+  }
+  updateSensorReadingWithRetry(5, 50);
   renderScreen();
-  refreshSensorIfNeeded();
 }
 
 void loop()
