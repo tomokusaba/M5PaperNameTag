@@ -1,4 +1,4 @@
-# sketch_may27a
+# M5PaperNameTag
 
 M5PaperColor 用の名札表示スケッチです。  
 上部に画像、下部に温度・湿度を表示します。
